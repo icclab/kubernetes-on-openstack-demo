@@ -1,0 +1,766 @@
+# Copyright 2014 Zuercher Hochschule fuer Angewandte Wissenschaften
+# All Rights Reserved.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+heat_template_version: 2013-05-23
+description: >
+  A simple Heat template to deploy CoreOS into an existing cluster.
+parameters:
+  public_net_id:
+    type: string
+    label: Public Network ID
+    description: ID of the public network to use
+  image_id:
+    type: string
+    label: Glance Image ID
+    description: ID of existing Glance image to use
+  key-pair:
+    type: string
+    label: SSH Key Pair
+    description: Name of the SSH Key pair to use
+    
+resources:
+  security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Kubernetes Security Group
+      name: kube-secrurity-group
+      rules:
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: tcp
+          port_range_min: 0
+          port_range_max: 65535
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: udp
+          port_range_min: 0
+          port_range_max: 65535
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: icmp
+  private_net:
+    type: OS::Neutron::Net
+    properties:
+      admin_state_up: true
+      name: kube-net
+  private_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      name: kube-subnet
+      cidr: 192.168.12.0/24
+      gateway_ip: 192.168.12.1
+      allocation_pools:
+        - start: 192.168.12.20
+          end: 192.168.12.99
+      dns_nameservers: [8.8.8.8, 8.8.4.4]
+      enable_dhcp: true
+      network_id: { get_resource: private_net }
+  router:
+    type: OS::Neutron::Router
+    properties:
+      name: kube-router
+      admin_state_up: true
+  router_gw:
+    type: OS::Neutron::RouterGateway
+    properties:
+      network_id: { get_param: public_net_id }
+      router_id: { get_resource: router }
+  router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: router }
+      subnet_id: { get_resource: private_subnet }
+
+  discovery_port:
+    type: OS::Neutron::Port
+    properties:
+      admin_state_up: true
+      network_id: { get_resource: private_net }
+      security_groups:
+        - { get_resource: security_group }
+      fixed_ips:
+        - ip_address: "192.168.12.10"
+  discovery:
+    type: OS::Nova::Server
+    properties:
+      name: discovery
+      image: { get_param: image_id }
+      flavor: m1.small
+      networks:
+        - port: { get_resource: discovery_port }
+      key_name: { get_param: key-pair }
+      user_data_format: RAW
+      user_data: |
+        #cloud-config
+        coreos:
+          fleet:
+            etcd_servers: http://127.0.0.1:4001
+            metadata: role=etcd
+          etcd:
+            name: etcd
+            addr: $private_ipv4:4001
+            bind-addr: 0.0.0.0
+            peer-addr: $private_ipv4:7001
+            cluster-active-size: 1
+            snapshot: true
+          units:
+            - name: etcd.service
+              command: start
+
+         
+  master_port:
+    type: OS::Neutron::Port
+    properties:
+      admin_state_up: true
+      network_id: { get_resource: private_net }
+      security_groups:
+        - { get_resource: security_group }
+  master_floatingip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net_id }
+      port_id: { get_resource: master_port }
+  master:
+    type: OS::Nova::Server
+    properties:
+      name: master
+      image: { get_param: image_id }
+      flavor: m1.small
+      networks:
+        - port: { get_resource: master_port }
+      key_name: { get_param: key-pair }
+      user_data_format: RAW
+      user_data: 
+        str_replace:
+          template: |
+            #cloud-config
+            coreos:
+              fleet:
+                public-ip: $private_ipv4
+                metadata: role=master
+              etcd:
+                discovery: http://$etcd_discovery_ip$:4001/v2/keys/cluster
+                addr: $private_ipv4:4001
+                peer-addr: $private_ipv4:7001
+              units:
+                - name: etcd.service
+                  command: start
+                - name: fleet.service
+                  command: start
+            
+                - name: flannel.service
+                  command: start
+                  content: |
+                    [Unit]
+                    Requires=etcd.service
+                    After=etcd.service
+            
+                    [Service]
+                    ExecStartPre=-/usr/bin/mkdir -p /opt/bin
+                    ExecStartPre=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/flannel/flanneld
+                    ExecStartPre=/usr/bin/chmod +x /opt/bin/flanneld
+                    ExecStartPre=/usr/bin/etcdctl -C http://$etcd_discovery_ip$:4001 set /coreos.com/network/config '{"Network":"10.100.0.0/16"}'
+                    ExecStart=/opt/bin/flanneld \
+                      -etcd-endpoint http://$etcd_discovery_ip$:4001 \
+                      -iface=$private_ipv4 \
+                      -logtostderr=true
+            
+                    [Install]
+                    WantedBy=multi-user.target
+            
+                - name: docker.service
+                  command: restart
+                  content: |
+                    [Unit]
+                    Description=Docker Application Container Engine
+                    Documentation=http://docs.docker.io
+                    Requires=flannel.service
+                    After=flannel.service
+            
+                    [Service]
+                    EnvironmentFile=/run/flannel/subnet.env
+                    ExecStartPre=-/usr/bin/ip link set dev docker0 down
+                    ExecStartPre=-/usr/sbin/brctl delbr docker0
+                    ExecStartPre=/bin/mount --make-rprivate /
+                    ExecStart=/usr/bin/docker -d -s=btrfs -H fd:// --bip=${FLANNEL_SUBNET} --mtu=${FLANNEL_MTU}
+                    Restart=on-failure
+                    RestartSec=5
+            
+                    [Install]
+                    WantedBy=multi-user.target
+            
+                - name: download-kubernetes.service
+                  command: start
+                  content: |
+                    [Unit]
+                    After=network-online.target
+                    Before=apiserver.service
+                    Before=controller-manager.service
+                    Description=Download Kubernetes Binaries
+                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                    Requires=network-online.target
+            
+                    [Service]
+                    ExecStart=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/kubernetes/apiserver
+                    ExecStart=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/kubernetes/controller-manager
+                    ExecStart=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/kubernetes/kubecfg
+                    ExecStart=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/kubernetes/scheduler
+                    ExecStart=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/kubernetes/kube-register
+                    ExecStart=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/kubernetes/proxy
+                    ExecStart=/usr/bin/chmod +x /opt/bin/apiserver
+                    ExecStart=/usr/bin/chmod +x /opt/bin/controller-manager
+                    ExecStart=/usr/bin/chmod +x /opt/bin/kubecfg
+                    ExecStart=/usr/bin/chmod +x /opt/bin/scheduler
+                    ExecStart=/usr/bin/chmod +x /opt/bin/kube-register
+                    ExecStart=/usr/bin/chmod +x /opt/bin/proxy
+                    RemainAfterExit=yes
+                    Type=oneshot
+            
+                - name: apiserver.service
+                  command: start
+                  content: |
+                    [Unit]
+                    After=etcd.service
+                    After=download-kubernetes.service
+                    ConditionFileIsExecutable=/opt/bin/apiserver
+                    Description=Kubernetes API Server
+                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                    Wants=etcd.service
+                    Wants=download-kubernetes.service
+            
+                    [Service]
+                    ExecStart=/opt/bin/apiserver \
+                    --address=0.0.0.0 \
+                    --port=8080 \
+                    --etcd_servers=http://$etcd_discovery_ip$:4001 \
+                    --machines=192.168.12.14,192.168.12.15,192.168.12.16 \
+                    --logtostderr=true
+                    Restart=always
+                    RestartSec=10
+            
+                    [Install]
+                    WantedBy=multi-user.target
+            
+                - name: scheduler.service
+                  command: start
+                  content: |
+                    [Unit]
+                    After=apiserver.service
+                    ConditionFileIsExecutable=/opt/bin/scheduler
+                    Description=Kubernetes Scheduler
+                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                    Wants=apiserver.service
+            
+                    [Service]
+                    ExecStart=/opt/bin/scheduler \
+                    --logtostderr=true \
+                    --master=127.0.0.1:8080
+                    Restart=always
+                    RestartSec=10
+            
+                    [Install]
+                    WantedBy=multi-user.target
+            
+                - name: controller-manager.service
+                  command: start
+                  content: |
+                    [Unit]
+                    After=etcd.service
+                    After=download-kubernetes.service
+                    ConditionFileIsExecutable=/opt/bin/controller-manager
+                    Description=Kubernetes Controller Manager
+                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                    Wants=etcd.service
+                    Wants=download-kubernetes.service
+            
+                    [Service]
+                    ExecStart=/opt/bin/controller-manager \
+                    --master=127.0.0.1:8080 \
+                    --logtostderr=true
+                    Restart=always
+                    RestartSec=10
+            
+                    [Install]
+                    WantedBy=multi-user.target
+            
+                - name: kube-register.service
+                  command: start
+                  content: |
+                    [Unit]
+                    After=etcd.service
+                    After=download-kubernetes.service
+                    ConditionFileIsExecutable=/opt/bin/kube-register
+                    Description=Kubernetes Registration Service
+                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                    Wants=etcd.service
+                    Wants=download-kubernetes.service
+            
+                    [Service]
+                    ExecStart=/opt/bin/kube-register \
+                      --metadata=role=kubernetes \
+                      --fleet-endpoint=unix:///var/run/fleet.sock \
+                      --api-endpoint=http://127.0.0.1:8080
+                    Restart=always
+                    RestartSec=10
+            
+                    [Install]
+                    WantedBy=multi-user.target
+                - name: proxy.service
+                  command: start
+                  content: |
+                    [Unit]
+                    After=etcd.service
+                    After=download-kubernetes.service
+                    ConditionFileIsExecutable=/opt/bin/proxy
+                    Description=Kubernetes Proxy
+                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                    Wants=etcd.service
+                    Wants=download-kubernetes.service
+            
+                    [Service]
+                    ExecStart=/opt/bin/proxy \
+                      --etcd_servers=http://$etcd_discovery_ip$:4001 --logtostderr=true
+                    Restart=always
+                    RestartSec=10
+            
+                    [Install]
+                    WantedBy=multi-user.target
+          params:
+            $etcd_discovery_ip$:
+              get_attr: [ discovery, first_address ]
+  minion-1_port:
+    type: OS::Neutron::Port
+    properties:
+      admin_state_up: true
+      network_id: { get_resource: private_net }
+      security_groups:
+        - { get_resource: security_group }
+  minion-1:
+    type: OS::Nova::Server
+    properties:
+      name: minion-1
+      image: { get_param: image_id }
+      flavor: m1.medium
+      networks:
+        - port: { get_resource: minion-1_port }
+      key_name: { get_param: key-pair }
+      user_data_format: RAW
+      user_data: 
+        str_replace:
+          template: |
+            #cloud-config
+            coreos:
+              etcd:
+                discovery: http://$etcd_discovery_ip$:4001/v2/keys/cluster
+                addr: $private_ipv4:4001
+                peer-addr: $private_ipv4:7001
+              fleet:
+                public-ip: $public_ipv4
+                metadata: role=kubernetes
+              units:
+                - name: etcd.service
+                  command: start
+                - name: fleet.service
+                  command: start
+                - name: flannel.service
+                  command: start
+                  content: |
+                    [Unit]
+                    Requires=etcd.service
+                    After=etcd.service
+            
+                    [Service]
+                    ExecStartPre=-/usr/bin/mkdir -p /opt/bin
+                    ExecStartPre=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/flannel/flanneld
+                    ExecStartPre=/usr/bin/chmod +x /opt/bin/flanneld
+                    ExecStartPre=/usr/bin/etcdctl set /coreos.com/network/config '{"Network":"10.100.0.0/16"}'
+                    ExecStart=/opt/bin/flanneld \
+                      -etcd-endpoint http://$etcd_discovery_ip$:4001 \
+                      -iface=$private_ipv4 \
+                      -logtostderr=true
+            
+                - name: docker.service
+                  command: restart
+                  content: |
+                    [Unit]
+                    Description=Docker Application Container Engine
+                    Documentation=http://docs.docker.io
+                    Requires=flannel.service
+                    After=flannel.service
+            
+                    [Service]
+                    EnvironmentFile=/run/flannel/subnet.env
+                    ExecStartPre=-/usr/bin/ip link set dev docker0 down
+                    ExecStartPre=-/usr/sbin/brctl delbr docker0
+                    ExecStartPre=/bin/mount --make-rprivate /
+                    ExecStart=/usr/bin/docker -d -s=btrfs -H fd:// --bip=${FLANNEL_SUBNET} --mtu=${FLANNEL_MTU}
+                    Restart=on-failure
+                    RestartSec=5
+            
+                    [Install]
+                    WantedBy=multi-user.target
+            
+                - name: download-kubernetes.service
+                  command: start
+                  content: |
+                    [Unit]
+                    After=network-online.target
+                    Before=kubelet.service
+                    Before=proxy.service
+                    Description=Download Kubernetes Binaries
+                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                    Requires=network-online.target
+            
+                    [Service]
+                    ExecStart=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/kubernetes/kubelet
+                    ExecStart=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/kubernetes/proxy
+                    ExecStart=/usr/bin/chmod +x /opt/bin/kubelet
+                    ExecStart=/usr/bin/chmod +x /opt/bin/proxy
+                    RemainAfterExit=yes
+                    Type=oneshot
+            
+                - name: kubelet.service
+                  command: start
+                  content: |
+                    [Unit]
+                    After=etcd.service
+                    After=download-kubernetes.service
+                    ConditionFileIsExecutable=/opt/bin/kubelet
+                    Description=Kubernetes Kubelet
+                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                    Wants=etcd.service
+                    Wants=download-kubernetes.service
+            
+                    [Service]
+                    ExecStart=/opt/bin/kubelet \
+                    --address=0.0.0.0 \
+                    --port=10250 \
+                    --hostname_override=$private_ipv4 \
+                    --etcd_servers=http://$etcd_discovery_ip$:4001 \
+                    --logtostderr=true
+                    Restart=always
+                    RestartSec=10
+            
+                    [Install]
+                    WantedBy=multi-user.target
+            
+                - name: proxy.service
+                  command: start
+                  content: |
+                    [Unit]
+                    After=etcd.service
+                    After=download-kubernetes.service
+                    ConditionFileIsExecutable=/opt/bin/proxy
+                    Description=Kubernetes Proxy
+                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                    Wants=etcd.service
+                    Wants=download-kubernetes.service
+            
+                    [Service]
+                    ExecStart=/opt/bin/proxy \
+                      --etcd_servers=http://$etcd_discovery_ip$:4001 --logtostderr=true
+                    Restart=always
+                    RestartSec=10
+            
+                    [Install]
+                    WantedBy=multi-user.target
+            
+          params:
+            $etcd_discovery_ip$:
+              get_attr: [ discovery, first_address ]
+  minion-2_port:
+    type: OS::Neutron::Port
+    properties:
+      admin_state_up: true
+      network_id: { get_resource: private_net }
+      security_groups:
+        - { get_resource: security_group }
+  minion-2:
+    type: OS::Nova::Server
+    properties:
+      name: minion-2
+      image: { get_param: image_id }
+      flavor: m1.medium
+      networks:
+        - port: { get_resource: minion-2_port }
+      key_name: { get_param: key-pair }
+      user_data_format: RAW
+      user_data: 
+        str_replace:
+          template: |
+            #cloud-config
+            coreos:
+              etcd:
+                discovery: http://$etcd_discovery_ip$:4001/v2/keys/cluster
+                addr: $private_ipv4:4001
+                peer-addr: $private_ipv4:7001
+              fleet:
+                public-ip: $public_ipv4
+                metadata: role=kubernetes
+              units:
+                - name: etcd.service
+                  command: start
+                - name: fleet.service
+                  command: start
+                - name: flannel.service
+                  command: start
+                  content: |
+                    [Unit]
+                    Requires=etcd.service
+                    After=etcd.service
+            
+                    [Service]
+                    ExecStartPre=-/usr/bin/mkdir -p /opt/bin
+                    ExecStartPre=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/flannel/flanneld
+                    ExecStartPre=/usr/bin/chmod +x /opt/bin/flanneld
+                    ExecStartPre=/usr/bin/etcdctl set /coreos.com/network/config '{"Network":"10.100.0.0/16"}'
+                    ExecStart=/opt/bin/flanneld \
+                      -etcd-endpoint http://$etcd_discovery_ip$:4001 \
+                      -iface=$private_ipv4 \
+                      -logtostderr=true
+            
+                - name: docker.service
+                  command: restart
+                  content: |
+                    [Unit]
+                    Description=Docker Application Container Engine
+                    Documentation=http://docs.docker.io
+                    Requires=flannel.service
+                    After=flannel.service
+            
+                    [Service]
+                    EnvironmentFile=/run/flannel/subnet.env
+                    ExecStartPre=-/usr/bin/ip link set dev docker0 down
+                    ExecStartPre=-/usr/sbin/brctl delbr docker0
+                    ExecStartPre=/bin/mount --make-rprivate /
+                    ExecStart=/usr/bin/docker -d -s=btrfs -H fd:// --bip=${FLANNEL_SUBNET} --mtu=${FLANNEL_MTU}
+                    Restart=on-failure
+                    RestartSec=5
+            
+                    [Install]
+                    WantedBy=multi-user.target
+            
+                - name: download-kubernetes.service
+                  command: start
+                  content: |
+                    [Unit]
+                    After=network-online.target
+                    Before=kubelet.service
+                    Before=proxy.service
+                    Description=Download Kubernetes Binaries
+                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                    Requires=network-online.target
+            
+                    [Service]
+                    ExecStart=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/kubernetes/kubelet
+                    ExecStart=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/kubernetes/proxy
+                    ExecStart=/usr/bin/chmod +x /opt/bin/kubelet
+                    ExecStart=/usr/bin/chmod +x /opt/bin/proxy
+                    RemainAfterExit=yes
+                    Type=oneshot
+            
+                - name: kubelet.service
+                  command: start
+                  content: |
+                    [Unit]
+                    After=etcd.service
+                    After=download-kubernetes.service
+                    ConditionFileIsExecutable=/opt/bin/kubelet
+                    Description=Kubernetes Kubelet
+                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                    Wants=etcd.service
+                    Wants=download-kubernetes.service
+            
+                    [Service]
+                    ExecStart=/opt/bin/kubelet \
+                    --address=0.0.0.0 \
+                    --port=10250 \
+                    --hostname_override=$private_ipv4 \
+                    --etcd_servers=http://$etcd_discovery_ip$:4001 \
+                    --logtostderr=true
+                    Restart=always
+                    RestartSec=10
+            
+                    [Install]
+                    WantedBy=multi-user.target
+            
+                - name: proxy.service
+                  command: start
+                  content: |
+                    [Unit]
+                    After=etcd.service
+                    After=download-kubernetes.service
+                    ConditionFileIsExecutable=/opt/bin/proxy
+                    Description=Kubernetes Proxy
+                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                    Wants=etcd.service
+                    Wants=download-kubernetes.service
+            
+                    [Service]
+                    ExecStart=/opt/bin/proxy \
+                      --etcd_servers=http://$etcd_discovery_ip$:4001 --logtostderr=true
+                    Restart=always
+                    RestartSec=10
+            
+                    [Install]
+                    WantedBy=multi-user.target
+            
+          params:
+            $etcd_discovery_ip$:
+              get_attr: [ discovery, first_address ]
+  minion-3_port:
+    type: OS::Neutron::Port
+    properties:
+      admin_state_up: true
+      network_id: { get_resource: private_net }
+      security_groups:
+        - { get_resource: security_group }
+  minion-3:
+    type: OS::Nova::Server
+    properties:
+      name: minion-3
+      image: { get_param: image_id }
+      flavor: m1.medium
+      networks:
+        - port: { get_resource: minion-3_port }
+      key_name: { get_param: key-pair }
+      user_data_format: RAW
+      user_data: 
+        str_replace:
+          template: |
+            #cloud-config
+            coreos:
+              etcd:
+                discovery: http://$etcd_discovery_ip$:4001/v2/keys/cluster
+                addr: $private_ipv4:4001
+                peer-addr: $private_ipv4:7001
+              fleet:
+                public-ip: $public_ipv4
+                metadata: role=kubernetes
+              units:
+                - name: etcd.service
+                  command: start
+                - name: fleet.service
+                  command: start
+                - name: flannel.service
+                  command: start
+                  content: |
+                    [Unit]
+                    Requires=etcd.service
+                    After=etcd.service
+            
+                    [Service]
+                    ExecStartPre=-/usr/bin/mkdir -p /opt/bin
+                    ExecStartPre=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/flannel/flanneld
+                    ExecStartPre=/usr/bin/chmod +x /opt/bin/flanneld
+                    ExecStartPre=/usr/bin/etcdctl set /coreos.com/network/config '{"Network":"10.100.0.0/16"}'
+                    ExecStart=/opt/bin/flanneld \
+                      -etcd-endpoint http://$etcd_discovery_ip$:4001 \
+                      -iface=$private_ipv4 \
+                      -logtostderr=true
+            
+                - name: docker.service
+                  command: restart
+                  content: |
+                    [Unit]
+                    Description=Docker Application Container Engine
+                    Documentation=http://docs.docker.io
+                    Requires=flannel.service
+                    After=flannel.service
+            
+                    [Service]
+                    EnvironmentFile=/run/flannel/subnet.env
+                    ExecStartPre=-/usr/bin/ip link set dev docker0 down
+                    ExecStartPre=-/usr/sbin/brctl delbr docker0
+                    ExecStartPre=/bin/mount --make-rprivate /
+                    ExecStart=/usr/bin/docker -d -s=btrfs -H fd:// --bip=${FLANNEL_SUBNET} --mtu=${FLANNEL_MTU}
+                    Restart=on-failure
+                    RestartSec=5
+            
+                    [Install]
+                    WantedBy=multi-user.target
+            
+                - name: download-kubernetes.service
+                  command: start
+                  content: |
+                    [Unit]
+                    After=network-online.target
+                    Before=kubelet.service
+                    Before=proxy.service
+                    Description=Download Kubernetes Binaries
+                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                    Requires=network-online.target
+            
+                    [Service]
+                    ExecStart=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/kubernetes/kubelet
+                    ExecStart=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/kubernetes/proxy
+                    ExecStart=/usr/bin/chmod +x /opt/bin/kubelet
+                    ExecStart=/usr/bin/chmod +x /opt/bin/proxy
+                    RemainAfterExit=yes
+                    Type=oneshot
+            
+                - name: kubelet.service
+                  command: start
+                  content: |
+                    [Unit]
+                    After=etcd.service
+                    After=download-kubernetes.service
+                    ConditionFileIsExecutable=/opt/bin/kubelet
+                    Description=Kubernetes Kubelet
+                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                    Wants=etcd.service
+                    Wants=download-kubernetes.service
+            
+                    [Service]
+                    ExecStart=/opt/bin/kubelet \
+                    --address=0.0.0.0 \
+                    --port=10250 \
+                    --hostname_override=$private_ipv4 \
+                    --etcd_servers=http://$etcd_discovery_ip$:4001 \
+                    --logtostderr=true
+                    Restart=always
+                    RestartSec=10
+            
+                    [Install]
+                    WantedBy=multi-user.target
+            
+                - name: proxy.service
+                  command: start
+                  content: |
+                    [Unit]
+                    After=etcd.service
+                    After=download-kubernetes.service
+                    ConditionFileIsExecutable=/opt/bin/proxy
+                    Description=Kubernetes Proxy
+                    Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+                    Wants=etcd.service
+                    Wants=download-kubernetes.service
+            
+                    [Service]
+                    ExecStart=/opt/bin/proxy \
+                      --etcd_servers=http://$etcd_discovery_ip$:4001 --logtostderr=true
+                    Restart=always
+                    RestartSec=10
+            
+                    [Install]
+                    WantedBy=multi-user.target
+            
+          params:
+            $etcd_discovery_ip$:
+              get_attr: [ discovery, first_address ]
+outputs:
+  floating_ip:
+    description: Public IP Address of Kubernetes master
+    value: { get_attr: [master_floatingip, floating_ip_address] }
+  key-pair:
+    description: SSH key-pair name for Kubernetes master
+    value: { get_param: key-pair }

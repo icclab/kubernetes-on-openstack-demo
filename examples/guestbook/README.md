@@ -80,5 +80,5 @@ Version
 License
 ----
 
-see LICENCE
+see LICENSE
 

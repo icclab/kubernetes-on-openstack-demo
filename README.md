@@ -34,7 +34,7 @@ https://coreos.com/docs/running-coreos/platforms/openstack/#import-the-image
 
 ###Clone the Git Repo:
 ```
-$ git clone icclab/kubernetes-on-openstack-demo
+$ git clone https://github.com/icclab/kubernetes-on-openstack-demo.git
 ```
 ### Parameters
 To start the stack, you need a few parameters. These can be retrieved directly from OpenStack:

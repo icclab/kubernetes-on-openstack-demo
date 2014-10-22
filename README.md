@@ -75,6 +75,11 @@ $ wget http://storage.googleapis.com/kubernetes/kubecfg -O /usr/local/bin/kubecf
 ```
 $ wget http://storage.googleapis.com/kubernetes/darwin/kubecfg -O /usr/local/bin/kubecfg
 ```
+Make the downloaded binary executable
+```
+$ chmod +x /usr/local/bin/kubecfg
+```
+
 Now setup a SSH tunnel to your kubernetes cluster
 ```
 $ ssh -f -nNT -L 8080:127.0.0.1:8080 core@${floating_ip}
@@ -93,6 +98,9 @@ Minion identifier
 192.168.12.23
 ```
 If it works, follow one of the examples provided.
+The guestbook example was taken from the kubernetes repo:
+https://github.com/GoogleCloudPlatform/kubernetes
+The frontend was slightly modified to display the hostname.
 
 Version
 ----

@@ -344,6 +344,8 @@ resources:
       network_id: { get_resource: private_net }
       security_groups:
         - { get_resource: security_group }
+      fixed_ips:
+        - ip_address: "192.168.12.14"
   minion-1:
     type: OS::Nova::Server
     properties:
@@ -484,6 +486,8 @@ resources:
       network_id: { get_resource: private_net }
       security_groups:
         - { get_resource: security_group }
+      fixed_ips:
+        - ip_address: "192.168.12.15"
   minion-2:
     type: OS::Nova::Server
     properties:
@@ -624,6 +628,8 @@ resources:
       network_id: { get_resource: private_net }
       security_groups:
         - { get_resource: security_group }
+      fixed_ips:
+        - ip_address: "192.168.12.16"
   minion-3:
     type: OS::Nova::Server
     properties:
